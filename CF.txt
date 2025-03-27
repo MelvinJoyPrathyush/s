@@ -1,0 +1,1411 @@
+#!/usr/bin/env python3
+"""
+This Python script is a complete, line‐by‐line translation of the provided SAS code.
+All functionality, variable names, and comments have been preserved exactly.
+The code uses pandas for DataFrame operations and datetime for date manipulations.
+Make sure that all the required CSV files exist in the specified paths.
+"""
+
+import os
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# -------------------------------
+# STEP 1: Libnames and macro variables - UPDATE
+# -------------------------------
+
+# Macro variables
+fy = 2020                         # current year  
+fq = 4                            # quarter of latest data cut
+fiscal = "2020-2021"
+first_day_str = "01APR2020"
+last_day_str  = "31Mar2021"
+
+# Parse date strings using the format %d%b%Y (the month is in abbreviated text form)
+first_day = pd.to_datetime(first_day_str, format="%d%b%Y")
+last_day  = pd.to_datetime(last_day_str, format="%d%b%Y")
+
+prev_year = fy - 1
+next_year = fy + 1
+
+# Libnames: define directories (adjust as needed)
+path_ccrs = r"J:\DataHoldings\PROD\CCRS\QTR 4"
+path_data = r"Q:\Groups\CCRS\PHISecure\Data Quality\Equity stratifier inventory update Fall 2021\CCRS\Data"
+path_results = r"Q:\Groups\CCRS\PHISecure\Data Quality\Equity stratifier inventory update Fall 2021\CCRS\Results"
+
+# Read in the required datasets from the CCRS library.
+# It is assumed that the files are in CSV format with the same names as in SAS.
+ccrs_ccrs_organization = pd.read_csv(os.path.join(path_ccrs, "ccrs_organization.csv"), parse_dates=["start_date", "end_date"])
+ccrs_ccrs_assessment   = pd.read_csv(os.path.join(path_ccrs, "ccrs_assessment.csv"), parse_dates=["assessment_date"])
+ccrs_ccrs_episode      = pd.read_csv(os.path.join(path_ccrs, "ccrs_episode.csv"), parse_dates=["start_date", "ab1_admission_re_entry_date", "admission_DATE", "DISCHARGE_DATE"])
+
+# data and results libraries will be used later for storing output DataFrames.
+data = {}
+results = {}
+
+# -------------------------------
+# Do the prep work
+# ccrs.organization table has submission start dates we need 
+# -------------------------------
+
+# Get all the organizations who started submitting after July 1 of reporting year;
+# SAS: proc sql; create table exclude1 as select organization_code, start_date from ccrs.ccrs_organization where start_date ge "01Jul&fy."d; quit;
+start_jul = pd.to_datetime("01Jul" + str(fy), format="%d%b%Y")
+exclude1 = ccrs_ccrs_organization.loc[ccrs_ccrs_organization["start_date"] >= start_jul, ["organization_code", "start_date"]].copy()
+
+# If a facility start date is in Q2, but has entry/discharge/assessment in Q1, 
+# we include it. if start date is in Q3 or Q4, do not include it anyway;
+# Get exclude1a: organizations with AB1_Admission_re_entry_date in Q1 among those whose start_date is between July 1 and September 30
+start_jul = pd.to_datetime("01Jul" + str(fy), format="%d%b%Y")
+end_sep = pd.to_datetime("30Sep" + str(fy), format="%d%b%Y")
+start_apr = pd.to_datetime("01Apr" + str(fy), format="%d%b%Y")
+end_jun = pd.to_datetime("30Jun" + str(fy), format="%d%b%Y")
+
+# First, filter organizations in exclude1 that have start_date between July 1 and September 30
+org_q2 = exclude1.loc[(exclude1["start_date"] >= start_jul) & (exclude1["start_date"] <= end_sep), "organization_code"]
+
+# For exclude1a from episode table based on admission date
+exclude1a = (ccrs_ccrs_episode.loc[
+    (ccrs_ccrs_episode["organization_code"].isin(org_q2)) &
+    (ccrs_ccrs_episode["ab1_admission_re_entry_date"] >= start_apr) &
+    (ccrs_ccrs_episode["ab1_admission_re_entry_date"] <= end_jun),
+    ["organization_code"]
+]).drop_duplicates()
+
+# For exclude1b from episode table based on discharge_date
+exclude1b = (ccrs_ccrs_episode.loc[
+    (ccrs_ccrs_episode["organization_code"].isin(org_q2)) &
+    (ccrs_ccrs_episode["DISCHARGE_DATE"] >= start_apr) &
+    (ccrs_ccrs_episode["DISCHARGE_DATE"] <= end_jun),
+    ["organization_code"]
+]).drop_duplicates()
+
+# For exclude1c from assessment table based on assessment_date
+exclude1c = (ccrs_ccrs_assessment.loc[
+    (ccrs_ccrs_assessment["organization_code"].isin(org_q2)) &
+    (ccrs_ccrs_assessment["assessment_date"] >= start_apr) &
+    (ccrs_ccrs_assessment["assessment_date"] <= end_jun),
+    ["organization_code"]
+]).drop_duplicates()
+
+# Creates a table of all the facilities where start date in Q2 but there is any 
+# admission, discharge or assessment in Q1
+exclude1d = pd.concat([exclude1a, exclude1b, exclude1c]).drop_duplicates()
+
+# Create table data.exclude from exclude1 excluding organizations in exclude1d
+data_exclude = exclude1.loc[~exclude1["organization_code"].isin(exclude1d["organization_code"])].copy()
+data["exclude"] = data_exclude.copy()
+
+# ********************************
+
+# Create a table to list all the unique organization codes by sector from the original organization table;
+data_sectors = ccrs_ccrs_organization.loc[:, ["organization_code", "sector_code"]].drop_duplicates()
+data["sectors"] = data_sectors.copy()
+
+# Harry - for next year, assign Prov leading with code 10, 35, 46;
+# Create a table from the original CCRS org table;
+# Setting Province/Sector  
+organization = ccrs_ccrs_organization.copy()
+
+# creating a new province for the report template to separate province by sector;
+def assign_prov(row):
+    if row["province_code"] == 'ON':
+        if row["SECTOR_CODE"] == 3:
+            return 'ONCCC'
+        else:
+            return 'ONLTC'
+    elif row["province_code"] == 'MB':
+        if row["SECTOR_CODE"] == 3:
+            return 'MBCCC'
+        else:
+            return 'MBLTC'
+    else:
+        return row["province_code"]
+
+organization["prov"] = organization.apply(assign_prov, axis=1)
+
+# create variable to identify organizations that were open in the fiscal year associated with the report;
+# if (start_date le last_day and start_date not missing) and (end_date ge first_day or end_date missing) then open_in_2020 = 1; else 0;
+organization["open_in_" + str(fy)] = organization.apply(
+    lambda row: 1 if (pd.notnull(row["start_date"]) and row["start_date"] <= last_day) and 
+                     ((pd.notnull(row["end_date"]) and row["end_date"] >= first_day) or pd.isnull(row["end_date"]))
+                else 0, axis=1)
+
+# Remove the organizations that have a start date after July 1
+# also get rid of excluded orgs
+organization = organization.loc[~organization["organization_code"].isin(data["exclude"]["organization_code"])].copy()
+
+# Create the Assessment Table with only the required variables
+# Note: The keep statement retains only the following variables:
+assessment_keep = [
+    "prov",
+    "province_code",
+    "organization_code",
+    "resident_id",
+    "aa1_uri",
+    "episode_id",
+    "assessment_id",
+    "AGE_ASSESSMENT",
+    "AA8_ASSESSMENT_TYPE",
+    "assessment_date",
+    "fiscal_year_ax",
+    "FISCAL_QUARTER_AX",
+    "DAY_IND",
+    "QUARTER_IND",
+    "f_dq_selection_assessment",
+    "in_" + str(fy),
+    "N_MEDICATION_RECORDS_SUBMITTED",
+    "aa4a_aborig_id_first_nations",
+    "aa4b_aborig_id_metis",
+    "aa4c_aborig_id_inuit",
+    "a7d_fed_fnihb",
+    "adl_hierarchy"
+]
+assessment = ccrs_ccrs_assessment.copy()
+# Keep only required columns if they exist; if not, they will be preserved if already there.
+assessment = assessment.loc[:, [col for col in assessment_keep if col in assessment.columns or col.lower() in [c.lower() for c in assessment.columns]]].copy()
+
+# Filter where f_dq_selection_assessment = 1;
+assessment = assessment.loc[assessment["f_dq_selection_assessment"] == 1].copy()
+
+# create a flag to identify if an assessment is in the current fiscal year;
+assessment["in_" + str(fy)] = assessment["fiscal_year_ax"].astype(str).apply(lambda x: 1 if x == str(fy) else 0)
+
+# Update province flag as in organization;
+assessment["prov"] = assessment.apply(assign_prov, axis=1)
+
+# Modify the assessment table to exclude any data from organizations that started submitting to CCRS partway through the fiscal year;
+assessment = assessment.loc[~assessment["organization_code"].isin(data["exclude"]["organization_code"])].copy()
+
+# Select all the full assessments from the previous assessment table;
+full_ax = assessment.copy()
+# Filter where assessment_date <= last_day
+full_ax = full_ax.loc[pd.to_datetime(full_ax["assessment_date"]) <= last_day].copy()
+# Create flag if aa8_assessment_type in (1,2,3)
+full_ax["has_full_ax"] = full_ax["AA8_ASSESSMENT_TYPE"].apply(lambda x: 1 if x in [1, 2, 3] else 0)
+
+# NOTE: a resident may have multiple full assessments within a FY. 
+# This code counts the number of assessments for each resident id within an organization;
+has_full_ax = (full_ax.groupby(["organization_code", "resident_id"])["has_full_ax"]
+               .sum()
+               .reset_index()
+               .rename(columns={"has_full_ax": "cnt_full_ax"}))
+
+# Get the age for the resident based on the latest full assessment completed in the year;
+age_at_last_ax = (full_ax.groupby(["organization_code", "resident_id"])["AGE_ASSESSMENT"]
+                  .max()
+                  .reset_index()
+                  .rename(columns={"AGE_ASSESSMENT": "age_at_last_ax"}))
+
+# Select episodes and create a flag to identify admissions and discharges within the fiscal year;
+episode_keep = [
+    "PROVINCE_CODE",
+    "SECTOR_CODE",
+    "organization_CODE",
+    "aa5b_prov_issue_health_card",
+    "RESIDENT_ID",
+    "EPISODE_ID",
+    "AA1_URI",
+    "AA5A_ENCRYPTED_HEALTH_CARD_NUM",
+    "AA5B_PROV_ISSUE_HEALTH_CARD",
+    "NON_UNIQUE_HCN",
+    "prov_hcn_invalid",
+    "HRN_invalid",
+    "A6A_HEALTH_RECORD_NUM",
+    "AA2_SEX_CODE",
+    "CONSISTENT_SEX_IND",
+    "AA3A_BIRTH_DATE",
+    "AA3B_ESTIMATED_BIRTH_DATE",
+    "CONSISTENT_BIRTH_DATE_IND",
+    "AGE_ENTRY",
+    "ab1_admission_re_entry_date",
+    "admission_DATE",
+    "ENTRY_service_TYPE",
+    "DISCHARGE_DATE",
+    "DISCHARGE_FLAG_IND",
+    "AGE_DISCHARGE",
+    "FISCAL_QUARTER_ENTRY",
+    "FISCAL_YEAR_ENTRY",
+    "FISCAL_QUARTER_DISCHARGE",
+    "FISCAL_YEAR_DISCHARGE",
+    "in_" + str(fy),
+    "prov",
+    "aa2_sex_code",
+    "ab7_education_completed",
+    "aa4a_aborig_id_first_nations",
+    "aa4b_aborig_id_metis",
+    "aa4c_aborig_id_inuit",
+    "ab4_resident_postal_code",
+    "ab8_language_code",
+    "a5_marital_status_adm",
+    "res_qaippe",
+    "res_sactype",
+    "res_urban_rural_code",
+    "a7d_federal_fnihb"
+]
+episode = ccrs_ccrs_episode.copy()
+# Keep only the required columns (if column names differ in case, they are assumed to match)
+episode = episode.loc[:, [col for col in episode_keep if col in episode.columns or col.lower() in [c.lower() for c in episode.columns]]].copy()
+
+# Filter where f_dq_selection_episode = 1;
+episode = episode.loc[episode["f_dq_selection_episode"] == 1].copy()
+
+# Create flag in_2020: if FISCAL_YEAR_ENTRY == "2020" or FISCAL_YEAR_DISCHARGE == "2020" then in_2020 = 1;
+episode["in_" + str(fy)] = episode.apply(
+    lambda row: 1 if (str(row.get("FISCAL_YEAR_ENTRY", "")) == str(fy)) or (str(row.get("FISCAL_YEAR_DISCHARGE", "")) == str(fy)) else 0, axis=1)
+
+# Update province flag as in organization;
+episode["prov"] = episode.apply(assign_prov, axis=1)
+
+# Exclude episodes from organizations who started submitting data part way through the year;
+episode = episode.loc[~episode["organization_CODE"].isin(data["exclude"]["organization_code"])].copy()
+
+# first entry_date per Resident_ID;
+# Sort by prov, ORGANIZATION_code, RESIDENT_ID, ab1_admission_re_entry_date
+episode = episode.sort_values(by=["prov", "organization_CODE", "RESIDENT_ID", "ab1_admission_re_entry_date"])
+
+# After sorting, take the latest record for resident ID within each organization.
+# The purpose is to get the latest admission for each resident id + org_id combination;
+entry_date = (episode.groupby(["prov", "organization_CODE", "RESIDENT_ID"], as_index=False)
+                     .last()[["RESIDENT_ID", "organization_CODE", "ab1_admission_re_entry_date"]]
+                     .rename(columns={"ab1_admission_re_entry_date": "resident_ID_admission_date"}))
+
+# Active in report year: was assessed, admitted or discharged in report year. 
+# Based on Resident_ID, so these are residents
+# Part 1: take all episode entries where there is an admission or discharge in the fiscal year (in_2020=1)
+in_fy_episode = episode.loc[episode["in_" + str(fy)] == 1, ["organization_CODE", "RESIDENT_ID", "in_" + str(fy)]].copy()
+
+# Part 2: take all the assessments from the current fiscal year and combine them
+in_fy_assess = assessment.loc[assessment["in_" + str(fy)] == 1, ["organization_code", "resident_id", "in_" + str(fy)]].copy()
+
+# Harmonize column names for union
+in_fy_assess = in_fy_assess.rename(columns={"organization_code": "organization_CODE", "resident_id": "RESIDENT_ID"})
+in_fy = pd.concat([in_fy_episode, in_fy_assess], ignore_index=True).drop_duplicates()
+
+# Sort episode by resident_id and ab1_admission_re_entry_date
+episode = episode.sort_values(by=["RESIDENT_ID", "ab1_admission_re_entry_date"])
+
+# this code calculates the assumed discharge field, as that field is no longer in ASOT
+
+# MACRO quarter_and_year (date, seq_qtr, fis_year );
+# This function assigns a QUART-Number and the Fiscal year for a date.
+def quarter_and_year(date_val):
+    # If date is missing, return NaN for both
+    if pd.isnull(date_val):
+        return (np.nan, np.nan)
+    # Calculate sequential quarter values relative to base date 01Jul1996
+    base_date = pd.Timestamp("01Jul1996", format="%d%b%Y")
+    # Calculate difference in months
+    total_months = (date_val.year - base_date.year) * 12 + (date_val.month - base_date.month)
+    seq_qtr = total_months // 3 + 1
+    # Determine Fiscal Year: if month in Jan, Feb, Mar then fiscal year is previous calendar year
+    if date_val.month in [1, 2, 3]:
+        fis_year = date_val.year - 1
+    else:
+        fis_year = date_val.year
+    return (seq_qtr, fis_year)
+
+# Call the macro to create a sequential quarter (aquart) and year (ayear) variable based on the assessment date; 
+assessment["AQUART"], assessment["AYEAR"] = zip(*assessment["assessment_date"].apply(quarter_and_year))
+
+# Sort Assessment table by episode_id and assessment_date; output to aquartsort
+aquartsort = assessment.sort_values(by=["episode_id", "assessment_date"]).copy()
+
+# Harry - later on, aquartsortcheck and aquartsortcheck_ep are created again???
+# Harry - keep last assessment of each episode;
+aquartsortcheck = aquartsort.groupby("episode_id", as_index=False).last()
+
+# Harry - right join, attach last assessment to episode;
+aquartsortcheck_ep = pd.merge(aquartsortcheck, episode, on="episode_id", how="right", suffixes=("", "_ep"))
+
+# Create table aqcheck: distinct fiscal_quarter_ax and aquart from aquartsortcheck_ep;
+aqcheck = aquartsortcheck_ep.loc[:, ["fiscal_quarter_ax", "AQUART"]].drop_duplicates()
+
+# 
+# The following commented out SAS code is preserved as comments:
+#
+# proc sql;
+# create table distaquart as
+# select distinct fiscal_quarter_ax, aquart
+# from aquartsort;
+# quit;
+# 87 2017Q4
+# 86 Q3
+# 85 Q2
+# 84 2017Q1
+#
+# 83 2016Q4
+# 82 2016Q3  last year I used 82, likely should here too
+# 81 Q2
+# 80 2016Q1
+#
+# last year I used
+# if discharge_date = . and ((aquart ge 79 and aquart lt 82)) then   assumed_discharge_date = '01APR2017'd;
+
+# Harry - the record with entry date only has aquart = . and discharge_date = .;
+# Harry -  missing longitudinal record is defined as having activity in quarter 1, 2 or 3 of the
+# reporting fiscal year for whom expected assessment or discharge was not submitted 
+# for at least one fiscal quarter by the end of the reporting fiscal year = assumed_discharge???;
+# Harry - aquart ge 91 and aquart lt 94 -> 2018Q4, 2019Q1 2019Q2 ???  changed to 92 and 95, updated July2020;
+# Harry - not use the result in ASD, we will use PCT_ASM_DIS for missing record indicator;
+
+# Data step add: attaching assumed discharge date based on conditions;
+add = aquartsortcheck_ep.copy()
+# Ensure assumed_discharge_date is a datetime column (initially missing)
+add["assumed_discharge_date"] = pd.NaT
+
+# Jenn: if they have no assessment (aquart is missing), no discharge (discharge_date is missing)
+# and were admitted in Q1-Q3 then assume a discharge date of April 1;
+def assign_assumed_discharge_date(row):
+    # Parse fiscal_quarter_entry as string if not already
+    fq_entry = str(row.get("FISCAL_QUARTER_ENTRY", ""))
+    # Check condition 1: aquart is missing and discharge_date is missing and fiscal_quarter_entry in ('2020Q1','2020Q2','2020Q3')
+    if pd.isnull(row.get("AQUART")) and pd.isnull(row.get("DISCHARGE_DATE")) and (fq_entry in ['2020Q1', '2020Q2', '2020Q3']):
+        return pd.Timestamp("01APR2021", format="%d%b%Y")
+    # Check condition 2: discharge_date is missing and aquart in [92, 95) (>=92 and <95)
+    if pd.isnull(row.get("DISCHARGE_DATE")):
+        aquart_val = row.get("AQUART")
+        if pd.notnull(aquart_val) and (aquart_val >= 92 and aquart_val < 95):
+            return pd.Timestamp("01APR2021", format="%d%b%Y")
+    return row.get("assumed_discharge_date")
+
+add["assumed_discharge_date"] = add.apply(assign_assumed_discharge_date, axis=1)
+
+# Proc freq on add dataset;
+# In Python, we use value_counts on the combination of assumed_discharge_date and prov.
+asd_freq = pd.crosstab(add["assumed_discharge_date"], add["prov"], dropna=False)
+# Optionally, output asd_freq to inspect frequencies.
+
+# Add information on assumed discharge to a subset of the episodes;
+episode_a = pd.merge(episode, add.loc[:, ["episode_id", "assumed_discharge_date"]], on="episode_id", how="left")
+
+# Identify duplicates: Count records per episode_id with COUNT(*) > 1;
+dupep = (episode_a.groupby("episode_id")
+         .filter(lambda grp: len(grp) > 1)
+         .copy())
+# dupep now contains duplicate episode_id records.
+
+# Sort the episode table with the assumed discharge information;
+episode_a = episode_a.sort_values(by=["organization_CODE", "RESIDENT_ID", "ab1_admission_re_entry_date"])
+
+# The following commented code from SAS is preserved:
+# /* don't need?
+# data episode_a2;
+# set episode_a;
+#
+# if "&first_day."d le ASSUMED_DISCHARGE_DATE le "&last_day."d
+#	then ASSUMED_DISCHARGE = 1;
+#
+# if last.aa1_uri;
+# by aa1_uri admission_date;
+# run; */
+
+# Keep last re-entry episode for a resident in a facility;
+episode_a2 = episode_a.sort_values(by=["organization_CODE", "RESIDENT_ID", "ab1_admission_re_entry_date"]).copy()
+# In SAS: if last.resident_id; by ORGANIZATION_code resident_id ab1_admission_re_entry_date;
+episode_a2 = episode_a2.groupby(["organization_CODE", "RESIDENT_ID"], as_index=False).last()
+
+# Assessed in report year
+# Get a unique list of residents (as defined by resident id + org id) from the assessment table where the resident was assessed in the fiscal year;
+ax_in_fy = assessment.loc[assessment["in_" + str(fy)] == 1, ["organization_code", "resident_id", "in_" + str(fy)]].drop_duplicates()
+# Rename columns to match episode table
+ax_in_fy = ax_in_fy.rename(columns={"organization_code": "ORGANIZATION_CODE"})
+
+# data episode_r: drop in_2020 column from episode_a2;
+cols_to_drop = ["in_" + str(fy)] if "in_" + str(fy) in episode_a2.columns else []
+episode_r = episode_a2.drop(columns=cols_to_drop)
+
+# in_2020 contains all events: assessed, admitted or discharged in report year.
+# right join in_fy to only keep episodes with event i.e. in_2020=1;
+episode_b = pd.merge(episode_r, in_fy, left_on=["RESIDENT_ID", "organization_CODE"], right_on=["RESIDENT_ID", "ORGANIZATION_CODE"], how="right")
+
+# ax_in_fy contains all assessment events. Attach ax flag ax_in_2020.
+episode_c = pd.merge(episode_b, ax_in_fy, left_on=["RESIDENT_ID", "organization_CODE"], right_on=["resident_id", "ORGANIZATION_CODE"], how="left")
+# Drop the redundant key column if needed
+episode_c.drop(columns=["resident_id"], inplace=True, errors="ignore")
+
+# Attach full ax flag;
+episode_d = pd.merge(episode_c, has_full_ax, left_on=["RESIDENT_ID", "organization_CODE"], right_on=["resident_id", "organization_code"], how="left")
+# Drop duplicate key columns
+episode_d.drop(columns=["resident_id", "organization_code"], inplace=True, errors="ignore")
+
+# Attach last re-entry date;
+episode_e = pd.merge(episode_d, entry_date, left_on=["RESIDENT_ID", "organization_CODE"], right_on=["RESIDENT_ID", "organization_CODE"], how="left")
+
+# Attach the person's age based on their age at last assessment - this won't apply to all entries because not everyone has an assessment; 
+episode_f = pd.merge(episode_e, age_at_last_ax, left_on=["RESIDENT_ID", "organization_CODE"], right_on=["resident_id", "organization_code"], how="left")
+episode_f.drop(columns=["resident_id", "organization_code"], inplace=True, errors="ignore")
+
+# episode_plus only keep episodes with event i.e. in_2020=1.
+# Also adding org start and end dates to each episode;
+episode_plus = pd.merge(episode_f, organization.loc[:, ["organization_code", "start_date", "end_date"]], left_on="organization_CODE", right_on="organization_code", how="left")
+episode_plus = episode_plus.loc[episode_plus["in_" + str(fy)] == 1].copy()
+
+# Add ORG_ID and resident_ID Combo variable. res_id_org is facility level resident identifier;
+episode_plus["res_id_org"] = episode_plus["organization_CODE"].astype(str) + episode_plus["RESIDENT_ID"].astype(str)
+
+# %missing age TF
+# Calculating using proc means
+# (This section is commented out in SAS; preserved as comment)
+#
+# Proc sort data=episode_plus;
+# by province_code;
+# run; 
+# data episode_plusa;
+# set episode_plus;
+# if AA3A_BIRTH_DATE=" " or "." then BD_missing=1;
+# run; 
+# Proc means data=episode_plusa;
+# var AA3A_BIRTH_DATE RESIDENT_ID BD_missing;
+# by province_code; 
+# run; 
+#
+# verifying results using proc freq
+# Proc sort data=episode_plusa;
+# by province_code;
+# run;
+# Proc freq data=episode_plusa;
+# table prov*AA3A_BIRTH_DATE;
+# by province_code;
+# Run; 
+# /*table too large, can't use proc freq */
+
+# calculating %missing income 
+episode_plus = episode_plus.sort_values(by=["province_code"])
+episode_plus_income = episode_plus.copy()
+# if missing(res_qaippe) or res_qaippe in (9,-7) then res_qaippe_missing=1;
+episode_plus_income["res_qaippe_missing"] = episode_plus_income["res_qaippe"].apply(
+    lambda x: 1 if (pd.isnull(x)) or (x in [9, -7]) else 0)
+
+# Proc means equivalent: group by province_code and count missing
+income = (episode_plus_income.groupby("province_code")
+          .agg(sum_missing=("res_qaippe_missing", "sum"), num_resident=("RESIDENT_ID", "count"))
+          .reset_index())
+
+# calculating percent missing 
+income["pctmiss"] = (income["sum_missing"] / income["num_resident"]) * 100
+
+# saving results into table results.missing_age_pct;
+results["missing_age_pct"] = income.copy()
+
+# calculating %missing urban/rural 
+episode_plus = episode_plus.sort_values(by=["province_code"])
+episode_plus_rural = episode_plus.copy()
+# if res_urban_rural_code=" " or " ." or res_urban_rural_code in (8) then res_urban_rural_code_missing =1;
+episode_plus_rural["res_urban_rural_code_missing"] = episode_plus_rural["res_urban_rural_code"].apply(
+    lambda x: 1 if (pd.isnull(x)) or (str(x).strip() == "") or (str(x).strip() == ".") or (x in [8]) else 0)
+
+# Proc means equivalent for urban/rural group by province_code
+rural_urban = (episode_plus_rural.groupby("province_code")
+               .agg(sum_missing=("res_urban_rural_code_missing", "sum"), num_resident=("RESIDENT_ID", "count"))
+               .reset_index())
+
+# calculating percent missing
+rural_urban["pctmiss"] = (rural_urban["sum_missing"] / rural_urban["num_resident"]) * 100
+
+# saving results into table results.missing_rural_pct;
+results["missing_rural_pct"] = rural_urban.copy()
+
+# Optionally, write the results DataFrames to CSV files in the results folder:
+income_missing_file = os.path.join(path_results, "missing_age_pct.csv")
+rural_urban_missing_file = os.path.join(path_results, "missing_rural_pct.csv")
+income.to_csv(income_missing_file, index=False)
+rural_urban.to_csv(rural_urban_missing_file, index=False)
+
+if __name__ == '__main__':
+    # For demonstration, print the heads of some key tables
+    print("--- data.exclude ---")
+    print(data["exclude"].head())
+    print("---- data.sectors ----")
+    print(data["sectors"].head())
+    print("---- organization ----")
+    print(organization.head())
+    print("---- assessment (FY {}) ----".format(fy))
+    print(assessment.head())
+    print("---- full_ax ----")
+    print(full_ax.head())
+    print("---- has_full_ax ----")
+    print(has_full_ax.head())
+    print("---- age_at_last_ax ----")
+    print(age_at_last_ax.head())
+    print("---- episode_plus ----")
+    print(episode_plus.head())
+    print("---- results missing_age_pct ----")
+    print(results["missing_age_pct"].head())
+    print("---- results missing_rural_pct ----")
+    print(results["missing_rural_pct"].head())
+    
+    # The script has now completed the translation of the SAS code.
+    
+	
+#!/usr/bin/env python3
+# Required dependencies and imports
+import os
+import pandas as pd
+import numpy as np
+
+# Ensure that the "results" folder exists for saving results
+os.makedirs("results", exist_ok=True)
+
+# Define fiscal year variable used in file name construction
+fy = "2020"  # Using 2020 as an example fiscal year
+
+# Load the main dataset "episode_plus" from a CSV file
+# (Assuming the file "episode_plus.csv" exists and has the same variables as used below)
+episode_plus = pd.read_csv("episode_plus.csv", dtype=str)  # using dtype=str to preserve values exactly
+
+#--------------------------------------------------------------------
+# /*calculating %missing age using age at admission */
+# Proc sort data=episode_plus;
+# by province_code;
+# run;
+episode_plus = episode_plus.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# data episode_plusa;
+# set episode_plusa.;
+# if age_entry=" " or "." then age_missing=1;
+# run;
+episode_plusa = episode_plus.copy()
+# Create new variable age_missing: set to 1 if age_entry is " " or "."
+episode_plusa["age_missing"] = episode_plusa["age_entry"].apply(lambda x: "1" if str(x).strip() in ["", "."] else "0")
+
+#--------------------------------------------------------------------
+# Proc means data=episode_plusa;
+# var age_entry RESIDENT_ID age_missing;
+# by province_code; 
+# run.
+grp_age = episode_plusa.groupby("province_code")[["age_entry", "RESIDENT_ID", "age_missing"]].agg(["count"])
+print("Proc means (age):")
+print(grp_age)
+
+#--------------------------------------------------------------------
+# /* verifying using proc freq */
+# proc freq data = episode_plusa;
+# tables age_entry;
+# run;
+print("\nProc freq (age_entry):")
+print(episode_plusa["age_entry"].value_counts(dropna=False))
+
+#--------------------------------------------------------------------
+# /* outputting results into table */
+# proc sql;
+# create table age_admission as
+# select province_code, sum(age_missing) as sum_missing, count(resident_id) as num_resident
+# from episode_plusa
+# group by province_code;
+# quit;
+age_admission = episode_plusa.groupby("province_code").agg(
+    sum_missing = pd.NamedAgg(column="age_missing", aggfunc=lambda x: x.astype(int).sum()),
+    num_resident = pd.NamedAgg(column="RESIDENT_ID", aggfunc="count")
+).reset_index()
+
+#--------------------------------------------------------------------
+# /*calculating perecent missing */
+# proc sql;
+# create table missing_age as
+# select *, ((sum_missing/num_resident)*100) as pctmiss
+# from age_admission
+# group by province_code;
+# quit;
+missing_age = age_admission.copy()
+missing_age["pctmiss"] = (missing_age["sum_missing"] / missing_age["num_resident"].replace(0, np.nan)) * 100
+
+#--------------------------------------------------------------------
+# /* saving results */
+# data results.missing_age_pct;
+# set missing_age;
+# run;
+missing_age.to_csv("results/missing_age_pct.csv", index=False)
+
+#--------------------------------------------------------------------
+# /*%missing sex TF*/
+# /*calculating %missing sex TF*/
+# Proc sort data=episode_plus;
+# by province_code;
+# run;
+episode_plus = episode_plus.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# data episode_plusb;
+# set episode_plus;
+# if aa2_sex_code=" " or "." then sex_missing=1;
+# run;
+episode_plusb = episode_plus.copy()
+episode_plusb["sex_missing"] = episode_plusb["aa2_sex_code"].apply(lambda x: "1" if str(x).strip() in ["", "."] else "0")
+
+#--------------------------------------------------------------------
+# Proc means data=episode_plusb;
+# var RESIDENT_ID sex_missing;
+# by province_code; 
+# run;
+grp_sex = episode_plusb.groupby("province_code")[["RESIDENT_ID", "sex_missing"]].agg(["count"])
+print("\nProc means (sex):")
+print(grp_sex)
+
+#--------------------------------------------------------------------
+# /*verifying results using proc freq */
+# Proc sort data=episode_plusb;
+# by province_code;
+# run;
+episode_plusb = episode_plusb.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# proc freq data=episode_plusb;
+# table province_code*aa2_sex_code;
+# run;
+print("\nProc freq (province_code * aa2_sex_code):")
+print(pd.crosstab(episode_plusb["province_code"], episode_plusb["aa2_sex_code"], dropna=False))
+
+#--------------------------------------------------------------------
+# proc freq data=episode_plusb;
+# tables aa2_sex_code;
+# run;
+print("\nProc freq (aa2_sex_code):")
+print(episode_plusb["aa2_sex_code"].value_counts(dropna=False))
+
+#--------------------------------------------------------------------
+# /*^no missing*/ 
+# (No code to translate for comment)
+
+#--------------------------------------------------------------------
+# /*outputting results into table */
+# proc sql;
+# create table sex as
+# select province_code, sum(sex_missing) as sum_missing, count(resident_id) as num_resident
+# from episode_plusb
+# group by province_code;
+# quit;
+sex = episode_plusb.groupby("province_code").agg(
+    sum_missing = pd.NamedAgg(column="sex_missing", aggfunc=lambda x: x.astype(int).sum()),
+    num_resident = pd.NamedAgg(column="RESIDENT_ID", aggfunc="count")
+).reset_index()
+
+#--------------------------------------------------------------------
+# /*calculating percent missing */
+# Proc sql;
+# create table missing_sex as
+# select *, ((sum_missing/num_resident)*100) as pctmiss
+# from sex
+# group by province_code;
+# quit;
+missing_sex = sex.copy()
+missing_sex["pctmiss"] = (missing_sex["sum_missing"] / missing_sex["num_resident"].replace(0, np.nan)) * 100
+
+#--------------------------------------------------------------------
+# /*saving results */
+# data results.missing_sex_pct;
+# set missing_sex;
+# run; 
+missing_sex.to_csv("results/missing_sex_pct.csv", index=False)
+
+#--------------------------------------------------------------------
+# /*calculating %education TF*/
+# /*using proc means */
+# Proc sort data=episode_plus;
+# by province_code;
+# run;
+episode_plus = episode_plus.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# data episode_plusc;
+# set episode_plus;
+# if ab7_education_completed=9 then ed_missing=1;
+# if ab7_education_completed=" " or "." then ed_missing=1;
+# run;
+episode_plusc = episode_plus.copy()
+def calc_ed_missing(x):
+    # Check if x equals 9 (as string or numeric) or is blank or "."
+    if str(x).strip() in ["", "."] or str(x).strip() == "9":
+        return "1"
+    else:
+        return "0"
+episode_plusc["ed_missing"] = episode_plusc["ab7_education_completed"].apply(calc_ed_missing)
+
+#--------------------------------------------------------------------
+# Proc means data=episode_plusc;
+# var ab7_education_completed ed_missing RESIDENT_ID;
+# by province_code; 
+# run;
+grp_edu = episode_plusc.groupby("province_code")[["ab7_education_completed", "ed_missing", "RESIDENT_ID"]].agg(["count"])
+print("\nProc means (education):")
+print(grp_edu)
+
+#--------------------------------------------------------------------
+# /*verifying results using proc freq */
+# Proc sort data=episode_plusc;
+# by province_code;
+# run;
+episode_plusc = episode_plusc.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# proc freq data=episode_plusc;
+# tables ab7_education_completed;
+# run;
+print("\nProc freq (ab7_education_completed):")
+print(episode_plusc["ab7_education_completed"].value_counts(dropna=False))
+
+#--------------------------------------------------------------------
+# Proc freq data=episode_plusc;
+# table province_code*ab7_education_completed;
+# by province_code;
+# Run;
+print("\nProc freq (province_code * ab7_education_completed):")
+print(pd.crosstab(episode_plusc["province_code"], episode_plusc["ab7_education_completed"], dropna=False))
+
+#--------------------------------------------------------------------
+# Proc freq data=episode_plusc;
+# table province_code*ed_missing;
+# by province_code;
+# Run;
+print("\nProc freq (province_code * ed_missing):")
+print(pd.crosstab(episode_plusc["province_code"], episode_plusc["ed_missing"], dropna=False))
+
+#--------------------------------------------------------------------
+# /*outputting results into table */
+# proc sql;
+# create table education as
+# select province_code, sum(ed_missing) as sum_missing, count(resident_id) as num_resident
+# from episode_plusc
+# group by province_code;
+# quit;
+education = episode_plusc.groupby("province_code").agg(
+    sum_missing = pd.NamedAgg(column="ed_missing", aggfunc=lambda x: x.astype(int).sum()),
+    num_resident = pd.NamedAgg(column="RESIDENT_ID", aggfunc="count")
+).reset_index()
+
+#--------------------------------------------------------------------
+# /*calculating percent missing */
+# Proc sql;
+# create table missing_education as
+# select *, ((sum_missing/num_resident)*100) as pctmiss
+# from education
+# group by province_code;
+# quit;
+missing_education = education.copy()
+missing_education["pctmiss"] = (missing_education["sum_missing"] / missing_education["num_resident"].replace(0, np.nan)) * 100
+
+#--------------------------------------------------------------------
+# /*saving results */
+# data results.missing_education_pct;
+# set missing_education;
+# run; 
+missing_education.to_csv("results/missing_education_pct.csv", index=False)
+
+#--------------------------------------------------------------------
+# /*calculating %missing Indigenous Identity */
+# Data episode_plusd;
+# set episode_plus;
+# keep aa4a_aborig_id_first_nations aa4b_aborig_id_metis aa4c_aborig_id_inuit
+# episode_id province_code resident_id;
+# run;
+cols_keep = ["aa4a_aborig_id_first_nations", "aa4b_aborig_id_metis", "aa4c_aborig_id_inuit", "episode_id", "province_code", "resident_id"]
+episode_plusd = episode_plus[cols_keep].copy()
+
+#--------------------------------------------------------------------
+# Proc sort data=episode_plusd;
+# by episode_id;
+# run;
+episode_plusd = episode_plusd.sort_values(by="episode_id")
+
+#--------------------------------------------------------------------
+# Data assessment_ab;
+# set assessment&fy.;
+# aa4a_aborig_id_first_nations1=aa4a_aborig_id_first_nations;
+# aa4b_aborig_id_metis1=aa4b_aborig_id_metis;
+# aa4c_aborig_id_inuit1=aa4c_aborig_id_inuit;
+# keep aa4a_aborig_id_first_nations1 aa4b_aborig_id_metis1 aa4c_aborig_id_inuit1
+# episode_id province_code resident_id;
+# run;
+assessment = pd.read_csv("assessment" + fy + ".csv", dtype=str)
+assessment_ab = assessment.copy()
+assessment_ab["aa4a_aborig_id_first_nations1"] = assessment_ab["aa4a_aborig_id_first_nations"]
+assessment_ab["aa4b_aborig_id_metis1"] = assessment_ab["aa4b_aborig_id_metis"]
+assessment_ab["aa4c_aborig_id_inuit1"] = assessment_ab["aa4c_aborig_id_inuit"]
+assessment_ab = assessment_ab[["aa4a_aborig_id_first_nations1", "aa4b_aborig_id_metis1", "aa4c_aborig_id_inuit1", "episode_id", "province_code", "resident_id"]].copy()
+
+#--------------------------------------------------------------------
+# proc sort data=assessment_ab;
+# by episode_id;
+# run;
+assessment_ab = assessment_ab.sort_values(by="episode_id")
+
+#--------------------------------------------------------------------
+# Data ab;
+# 	merge episode_plusd (in=a) assessment_ab (in=b);
+# 	by episode_id;
+# 	if a=1;
+# run;
+ab = pd.merge(episode_plusd, assessment_ab, on="episode_id", how="left")
+# Only keep rows that originated from episode_plusd (i.e. the left merge always keeps these)
+
+#--------------------------------------------------------------------
+# /*determing % missing by creating combined variable for
+# aborginal identity */
+# Data ab_combined;
+# set ab;
+# if aa4a_aborig_id_first_nations= "." and aa4b_aborig_id_metis="." 
+# and aa4c_aborig_id_inuit= "." and aa4a_aborig_id_first_nations1= "." and aa4b_aborig_id_metis1="." 
+# and aa4c_aborig_id_inuit1= "." then ab_missing=1;
+# run;
+def calc_ab_missing(row):
+    cols = ["aa4a_aborig_id_first_nations", "aa4b_aborig_id_metis", "aa4c_aborig_id_inuit",
+            "aa4a_aborig_id_first_nations1", "aa4b_aborig_id_metis1", "aa4c_aborig_id_inuit1"]
+    # If all specified columns equal "." then set ab_missing = 1; else 0.
+    if all(str(row.get(col, "")).strip() == "." for col in cols):
+        return "1"
+    else:
+        return "0"
+ab_combined = ab.copy()
+ab_combined["ab_missing"] = ab_combined.apply(calc_ab_missing, axis=1)
+
+#--------------------------------------------------------------------
+# Proc sort data=ab_combined;
+# by province_code;
+# run;
+ab_combined = ab_combined.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# Proc means data=ab_combined;
+# var ab_missing Resident_ID;
+# by province_code;
+# run;
+grp_ab = ab_combined.groupby("province_code")[["ab_missing", "RESIDENT_ID"]].agg(["count"])
+print("\nProc means (Indigenous Identity - ab_combined):")
+print(grp_ab)
+
+#--------------------------------------------------------------------
+# data ab_combined_check;
+# set ab_combined;
+# keep province_code resident_id episode_id ab_missing;
+# run;
+ab_combined_check = ab_combined[["province_code", "resident_id", "episode_id", "ab_missing"]].copy()
+
+#--------------------------------------------------------------------
+# proc sort data=ab_combined_check out=sorted; 
+# by province_code resident_id ab_missing;
+# run;
+sorted_df = ab_combined_check.sort_values(by=["province_code", "resident_id", "ab_missing"])
+
+#--------------------------------------------------------------------
+# data sorted2;
+# set sorted;
+# by province_code resident_id;
+# if first.resident_id;
+# run;
+# To simulate "if first.resident_id", we drop duplicates based on province_code and resident_id, keeping the first occurrence.
+sorted2 = sorted_df.drop_duplicates(subset=["province_code", "resident_id"], keep="first")
+
+#--------------------------------------------------------------------
+# proc means data=sorted2 n nmiss; 
+# class province_code; 
+# var ab_missing; 
+# run;
+grp_sorted2 = sorted2.groupby("province_code")["ab_missing"].agg(["count"])
+print("\nProc means (sorted2 - Indigenous Identity):")
+print(grp_sorted2)
+
+#--------------------------------------------------------------------
+# /*outputting results into table */
+# proc sql;
+# create table indigenous_identity as
+# select province_code, sum(ab_missing) as sum_missing, count(resident_id) as num_resident
+# from ab_combined
+# group by province_code;
+# quit;
+indigenous_identity = ab_combined.groupby("province_code").agg(
+    sum_missing = pd.NamedAgg(column="ab_missing", aggfunc=lambda x: x.astype(int).sum()),
+    num_resident = pd.NamedAgg(column="resident_id", aggfunc="count")
+).reset_index()
+
+#--------------------------------------------------------------------
+# proc sql;
+# create table indigenous_identity2 as
+# select province_code, sum(ab_missing) as sum_missing, count(resident_id) as num_resident
+# from sorted2
+# group by province_code;
+# quit;
+indigenous_identity2 = sorted2.groupby("province_code").agg(
+    sum_missing = pd.NamedAgg(column="ab_missing", aggfunc=lambda x: x.astype(int).sum()),
+    num_resident = pd.NamedAgg(column="resident_id", aggfunc="count")
+).reset_index()
+
+#--------------------------------------------------------------------
+# /*calculating percent missing */
+# Proc sql;
+# create table missing_indigenous_identity as
+# select *, ((sum_missing/num_resident)*100) as pctmiss
+# from indigenous_identity2
+# group by province_code;
+# quit;
+missing_indigenous_identity = indigenous_identity2.copy()
+missing_indigenous_identity["pctmiss"] = (missing_indigenous_identity["sum_missing"] / 
+    missing_indigenous_identity["num_resident"].replace(0, np.nan)) * 100
+
+#--------------------------------------------------------------------
+# /*saving results */
+# data results.missing_indigenous_pct;
+# set missing_indigenous_identity;
+# run;
+missing_indigenous_identity.to_csv("results/missing_indigenous_pct.csv", index=False)
+
+#--------------------------------------------------------------------
+# /*calculating %missing disability */
+# data assessment_a;
+# set assessment&fy.;
+# if adl_hierarchy=" " or "." then adl_missing=1;
+# run;
+assessment_a = pd.read_csv("assessment" + fy + ".csv", dtype=str)
+assessment_a["adl_missing"] = assessment_a["adl_hierarchy"].apply(lambda x: "1" if str(x).strip() in ["", "."] else "0")
+
+#--------------------------------------------------------------------
+# proc sort data=assessment_a;
+# by province_code;
+# run;
+assessment_a = assessment_a.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# Proc means data=assessment_a;
+# var adl_missing Resident_ID;
+# by province_code;
+# run;
+grp_adl = assessment_a.groupby("province_code")[["adl_missing", "RESIDENT_ID"]].agg(["count"])
+print("\nProc means (disability):")
+print(grp_adl)
+
+#--------------------------------------------------------------------
+# /* verifying using proc freq */
+# Proc sort data=assessment_a;
+# by province_code;
+# run;
+assessment_a = assessment_a.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# Proc freq data=assessment_a;
+# table province_code*adl_hierarchy;
+# by province_code;
+# Run;
+print("\nProc freq (province_code * adl_hierarchy):")
+print(pd.crosstab(assessment_a["province_code"], assessment_a["adl_hierarchy"], dropna=False))
+
+#--------------------------------------------------------------------
+# proc freq data=assessment_a;
+# table adl_hierarchy;
+# run;
+print("\nProc freq (adl_hierarchy):")
+print(assessment_a["adl_hierarchy"].value_counts(dropna=False))
+# /*missing n=1 */
+
+#--------------------------------------------------------------------
+# /*outputting results into table */
+# proc sql;
+# create table disability as
+# select province_code, sum(adl_missing) as sum_missing, count(resident_id) as num_resident
+# from assessment_a
+# group by province_code;
+# quit;
+disability = assessment_a.groupby("province_code").agg(
+    sum_missing = pd.NamedAgg(column="adl_missing", aggfunc=lambda x: x.astype(int).sum()),
+    num_resident = pd.NamedAgg(column="resident_id", aggfunc="count")
+).reset_index()
+
+#--------------------------------------------------------------------
+# /*calculating percent missing */
+# Proc sql;
+# create table missing_adl as
+# select *, ((sum_missing/num_resident)*100) as pctmiss
+# from disability
+# group by province_code;
+# quit;
+missing_adl = disability.copy()
+missing_adl["pctmiss"] = (missing_adl["sum_missing"] / missing_adl["num_resident"].replace(0, np.nan)) * 100
+
+#--------------------------------------------------------------------
+# /*saving results */
+# data results.missing_adl_pct;
+# set missing_adl;
+# run;
+missing_adl.to_csv("results/missing_adl_pct.csv", index=False)
+
+#--------------------------------------------------------------------
+# proc freq data = ccrs.ccrs_episode;
+# table ab8_language_code;
+# run;
+# Load ccrs_episode dataset (assuming file "ccrs_episode.csv")
+ccrs_episode = pd.read_csv("ccrs_episode.csv", dtype=str)
+print("\nProc freq (ccrs_episode: ab8_language_code):")
+print(ccrs_episode["ab8_language_code"].value_counts(dropna=False))
+
+#--------------------------------------------------------------------
+# /*calculating %missing language, combing missing+unknown values */
+# Data episode_pluse;
+# set episode_plus;
+# if ab8_language_code= " " or "." then lang_missing=1;
+# if  ab8_language_code= "UNK" then lang_missing=1;
+# run;
+episode_pluse = episode_plus.copy()
+def calc_lang_missing(x):
+    if str(x).strip() in ["", "."] or str(x).strip() == "UNK":
+        return "1"
+    else:
+        return "0"
+episode_pluse["lang_missing"] = episode_pluse["ab8_language_code"].apply(calc_lang_missing)
+
+#--------------------------------------------------------------------
+# Proc sort data=episode_pluse;
+# by province_code;
+# run;
+episode_pluse = episode_pluse.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# Proc means data=episode_pluse;
+# var lang_missing Resident_ID;
+# by province_code;
+# run;
+grp_lang = episode_pluse.groupby("province_code")[["lang_missing", "RESIDENT_ID"]].agg(["count"])
+print("\nProc means (language):")
+print(grp_lang)
+
+#--------------------------------------------------------------------
+# proc freq data=episode_pluse;
+# tables lang_missing;
+# run;
+print("\nProc freq (lang_missing):")
+print(episode_pluse["lang_missing"].value_counts(dropna=False))
+
+#--------------------------------------------------------------------
+# /*using proc freq to verify */
+# proc sort data=episode_pluse;
+# by province_code;
+# run;
+episode_pluse = episode_pluse.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# proc freq data=episode_pluse;
+# tables ab8_language_code;
+# run;
+print("\nProc freq (ab8_language_code):")
+print(episode_pluse["ab8_language_code"].value_counts(dropna=False))
+
+#--------------------------------------------------------------------
+# proc freq data=episode_pluse;
+# tables province_code*ab8_language_code;
+# by province_code;
+# run;
+print("\nProc freq (province_code * ab8_language_code):")
+print(pd.crosstab(episode_pluse["province_code"], episode_pluse["ab8_language_code"], dropna=False))
+
+#--------------------------------------------------------------------
+# /*outputting results into table */
+# proc sql;
+# create table language as
+# select province_code, sum(lang_missing) as sum_missing, count(resident_id) as num_resident
+# from episode_pluse
+# group by province_code;
+# quit;
+language = episode_pluse.groupby("province_code").agg(
+    sum_missing = pd.NamedAgg(column="lang_missing", aggfunc=lambda x: x.astype(int).sum()),
+    num_resident = pd.NamedAgg(column="RESIDENT_ID", aggfunc="count")
+).reset_index()
+
+#--------------------------------------------------------------------
+# /*calculating percent missing */
+# Proc sql;
+# create table missing_lang as
+# select *, ((sum_missing/num_resident)*100) as pctmiss
+# from language
+# group by province_code;
+# quit;
+missing_lang = language.copy()
+missing_lang["pctmiss"] = (missing_lang["sum_missing"] / missing_lang["num_resident"].replace(0, np.nan)) * 100
+
+#--------------------------------------------------------------------
+# /*saving results */
+# data results.missing_language_pct;
+# set missing_lang;
+# run;
+missing_lang.to_csv("results/missing_language_pct.csv", index=False)
+
+#--------------------------------------------------------------------
+# /*calculating %missing marital status from episode*/
+# data episode_plusf;
+# set episode_plus;
+# if a5_marital_status_adm= " " or "." then mar_missing=1;
+# if a5_marital_status_adm=9 then mar_missing=1;
+# run;
+episode_plusf = episode_plus.copy()
+def calc_mar_missing(x):
+    if str(x).strip() in ["", "."] or str(x).strip() == "9":
+        return "1"
+    else:
+        return "0"
+episode_plusf["mar_missing"] = episode_plusf["a5_marital_status_adm"].apply(calc_mar_missing)
+
+#--------------------------------------------------------------------
+# proc sort data=episode_plusf;
+# by province_code;
+# run;
+episode_plusf = episode_plusf.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# Proc means data=episode_plusf;
+# var mar_missing resident_id;
+# by province_code;
+# run;
+grp_mar = episode_plusf.groupby("province_code")[["mar_missing", "resident_id"]].agg(["count"])
+print("\nProc means (marital status from episode):")
+print(grp_mar)
+
+#--------------------------------------------------------------------
+# /*verifying use proc freq*/
+# proc sort data=episode_plusf;
+# by province_code;
+# run;
+episode_plusf = episode_plusf.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# Proc freq data=episode_plusf;
+# tables a5_marital_status_adm;
+# by province_code;
+# run;
+print("\nProc freq (a5_marital_status_adm from episode):")
+print(episode_plusf["a5_marital_status_adm"].value_counts(dropna=False))
+
+#--------------------------------------------------------------------
+# /*calculating %missing marital status from assessment*/
+# data assessmentm;
+# set assessment&fy.;
+# if a5_marital_status_adm= " " or "." then mar_missing=1;
+# if a5_marital_status_adm=9 then mar_missing=1;
+# run;
+assessmentm = pd.read_csv("assessment" + fy + ".csv", dtype=str)
+assessmentm["mar_missing"] = assessmentm["a5_marital_status_adm"].apply(calc_mar_missing)
+
+#--------------------------------------------------------------------
+# /*marital status completely missing from assessment table */
+# proc sort data=assessmentm;
+# by province_code;
+# run;
+assessmentm = assessmentm.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# Proc means data=assessmentm;
+# var mar_missing resident_id;
+# by province_code;
+# run;
+grp_ass_mar = assessmentm.groupby("province_code")[["mar_missing", "resident_id"]].agg(["count"])
+print("\nProc means (marital status from assessment):")
+print(grp_ass_mar)
+
+#--------------------------------------------------------------------
+# /*total missing: */
+# (No additional code provided)
+
+#--------------------------------------------------------------------
+# /*verifying use proc freq*/
+# proc sort data=assessmentm;
+# by province_code;
+# run;
+assessmentm = assessmentm.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# Proc freq data=assessmentm;
+# tables a5_marital_status_adm;
+# by province_code;
+# run;
+print("\nProc freq (a5_marital_status_adm from assessment):")
+print(assessmentm["a5_marital_status_adm"].value_counts(dropna=False))
+
+#--------------------------------------------------------------------
+# /*outputting results into table */
+# proc sql;
+# create table maritalstatus as
+# select province_code, sum(mar_missing) as sum_missing, count(resident_id) as num_resident
+# from episode_plusf
+# group by province_code;
+# quit;
+maritalstatus = episode_plusf.groupby("province_code").agg(
+    sum_missing = pd.NamedAgg(column="mar_missing", aggfunc=lambda x: x.astype(int).sum()),
+    num_resident = pd.NamedAgg(column="resident_id", aggfunc="count")
+).reset_index()
+
+#--------------------------------------------------------------------
+# /*calculating percent missing */
+# Proc sql;
+# create table missing_maritalstatus as
+# select *, ((sum_missing/num_resident)*100) as pctmiss
+# from maritalstatus
+# group by province_code;
+# quit;
+missing_maritalstatus = maritalstatus.copy()
+missing_maritalstatus["pctmiss"] = (missing_maritalstatus["sum_missing"] / missing_maritalstatus["num_resident"].replace(0, np.nan)) * 100
+
+#--------------------------------------------------------------------
+# /*saving results */
+# data results.missing_maritalstatus_pct;
+# set missing_maritalstatus;
+# run;
+missing_maritalstatus.to_csv("results/missing_maritalstatus_pct.csv", index=False)
+
+#--------------------------------------------------------------------
+# /*calculating %missing prior primary residence postal code */
+# data episode_plusg;
+# set episode_plus;
+# if ab4_resident_postal_code=" " or "." then post_missing=1;
+# run;
+episode_plusg = episode_plus.copy()
+episode_plusg["post_missing"] = episode_plusg["ab4_resident_postal_code"].apply(lambda x: "1" if str(x).strip() in ["", "."] else "0")
+
+#--------------------------------------------------------------------
+# proc sort data=episode_plusg;
+# by province_code;
+# run;
+episode_plusg = episode_plusg.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# proc means data=episode_plusg;
+# var post_missing resident_id;
+# by province_code;
+# run;
+grp_post = episode_plusg.groupby("province_code")[["post_missing", "resident_id"]].agg(["count"])
+print("\nProc means (postal code - initial):")
+print(grp_post)
+
+#--------------------------------------------------------------------
+# /*calculating partial postal code*/
+# data episode_plusg;
+# set episode_plusg;
+# length_postal=length(ab4_resident_postal_code);
+# if ab4_resident_postal_code=" " or "." then post_missing=1;
+# run;
+episode_plusg["length_postal"] = episode_plusg["ab4_resident_postal_code"].apply(lambda x: len(str(x).strip()))
+# Again update post_missing if blank (redundant)
+episode_plusg["post_missing"] = episode_plusg["ab4_resident_postal_code"].apply(lambda x: "1" if str(x).strip() in ["", "."] else "0")
+
+#--------------------------------------------------------------------
+# proc freq data=episode_plusg;
+# tables length_postal;
+# run;
+print("\nProc freq (length_postal):")
+print(episode_plusg["length_postal"].value_counts(dropna=False))
+
+#--------------------------------------------------------------------
+# proc freq data=episode_plusg;
+# tables ab4_resident_postal_code;
+# run;
+print("\nProc freq (ab4_resident_postal_code):")
+print(episode_plusg["ab4_resident_postal_code"].value_counts(dropna=False))
+
+#--------------------------------------------------------------------
+# /*combining missing and partial postal code */
+# data episode_plusga;
+# set episode_plusg;
+# if length_postal=2 then post_missing=1;
+# if ab4_resident_postal_code=" " or "." then post_missing=1;
+# run;
+episode_plusga = episode_plusg.copy()
+episode_plusga["post_missing"] = episode_plusga.apply(lambda row: "1" if (row["length_postal"]==2 or str(row["ab4_resident_postal_code"]).strip() in ["", "."]) else "0", axis=1)
+
+#--------------------------------------------------------------------
+# proc sort data=episode_plusga;
+# by province_code;
+# run;
+episode_plusga = episode_plusga.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# proc means data=episode_plusga;
+# var post_missing resident_id;
+# by province_code;
+# run;
+grp_post_ga = episode_plusga.groupby("province_code")[["post_missing", "resident_id"]].agg(["count"])
+print("\nProc means (postal code - updated with partial):")
+print(grp_post_ga)
+
+#--------------------------------------------------------------------
+# /*looking at postal codes with length of 1 and 2 */
+# data postalcode2;
+# set episode_plusg;
+# where length_postal=2;
+# run;
+postalcode2 = episode_plusg[episode_plusg["length_postal"]==2].copy()
+
+#--------------------------------------------------------------------
+# proc freq data=postalcode2;
+# tables ab4_resident_postal_code;
+# run;
+print("\nProc freq (postalcode2 - ab4_resident_postal_code):")
+print(postalcode2["ab4_resident_postal_code"].value_counts(dropna=False))
+
+#--------------------------------------------------------------------
+# data postalcode1;
+# set episode_plusg;
+# where length_postal=1;
+# run;
+postalcode1 = episode_plusg[episode_plusg["length_postal"]==1].copy()
+# /*length_postal=1 are missing values */
+
+#--------------------------------------------------------------------
+# /*verifying using proc freq */
+# proc sort data=episode_plusga;
+# by province_code;
+# run;
+episode_plusga = episode_plusga.sort_values(by="province_code")
+
+#--------------------------------------------------------------------
+# proc freq data=episode_plusga;
+# tables province_code*post_missing; /*province_code*ab4_resident_postal_code*table too long to run*/
+# run;
+print("\nProc freq (province_code * post_missing):")
+print(pd.crosstab(episode_plusga["province_code"], episode_plusga["post_missing"], dropna=False))
+
+#--------------------------------------------------------------------
+# proc freq data=episode_plusga;
+# tables ab4_resident_postal_code;
+# by province_code;
+# run;
+print("\nProc freq (province_code * ab4_resident_postal_code):")
+print(pd.crosstab(episode_plusga["province_code"], episode_plusga["ab4_resident_postal_code"], dropna=False))
+
+#--------------------------------------------------------------------
+# /*^(without partial) AB: no missing, BC:149, MB:1, NL:no missing, 
+# NS:no missing, ON:227   SK: 0 missing YT: 1 total: 378
+#
+# /*outputting results into table(updated with partial codes) */
+# proc sql;
+# create table postal_code1 as
+# select province_code, sum(post_missing) as sum_missing, count(resident_id) as num_resident
+# from episode_plusga
+# group by province_code;
+# quit;
+postal_code1 = episode_plusga.groupby("province_code").agg(
+    sum_missing = pd.NamedAgg(column="post_missing", aggfunc=lambda x: x.astype(int).sum()),
+    num_resident = pd.NamedAgg(column="resident_id", aggfunc="count")
+).reset_index()
+
+#--------------------------------------------------------------------
+# /*calculating percent missing */
+# Proc sql;
+# create table missing_residential_postalcode as
+# select *, ((sum_missing/num_resident)*100) as pctmiss
+# from postal_code1
+# group by province_code;
+# quit;
+missing_residential_postalcode = postal_code1.copy()
+missing_residential_postalcode["pctmiss"] = (missing_residential_postalcode["sum_missing"] / missing_residential_postalcode["num_resident"].replace(0, np.nan)) * 100
+
+#--------------------------------------------------------------------
+# /*saving results */
+# data results.missing_postalcode_pct;
+# set missing_residential_postalcode;
+# run;
+missing_residential_postalcode.to_csv("results/missing_postalcode_pct.csv", index=False)
+
+# End of Python translation of the SAS code.
+print("\nAll processing complete. Results saved in the 'results' folder.")
+  
+if __name__ == '__main__':
+    pass
+       
+	
+	

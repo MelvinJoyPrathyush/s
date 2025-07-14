@@ -1,0 +1,57 @@
+﻿import concurrent.futures
+import multiprocessing
+import time
+
+catalog_name = "cortex_dev_catalog"
+
+def get_views_for_schema(schema):
+    """Get views for a single schema"""
+    try:
+        views_query = f"SHOW VIEWS IN {catalog_name}.{schema}"
+        views_df = spark.sql(views_query)
+        return views_df.collect()
+    except Exception as e:
+        print(f"Error processing schema {schema}: {str(e)}")
+        return []
+
+# Get all schemas in the catalog
+schemas_query = f"SHOW SCHEMAS IN {catalog_name}"
+schemas_df = spark.sql(schemas_query)
+schemas = [row['databaseName'] for row in schemas_df.collect()]
+
+# Filter schemas containing 'raw' or 'cdm'
+filtered_schemas = [s for s in schemas if 'raw' in s.lower() or 'cdm' in s.lower()]
+
+print(f"Total schemas: {len(schemas)}")
+print(f"Filtered schemas (raw/cdm): {len(filtered_schemas)}")
+
+# Detect number of CPU cores
+num_cores = multiprocessing.cpu_count()
+print(f"Using {num_cores} CPU cores")
+
+# Get all views using multi-threading
+start_time = time.time()
+views = []
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=num_cores) as executor:
+    # Submit all tasks
+    future_to_schema = {executor.submit(get_views_for_schema, schema): schema for schema in filtered_schemas}
+
+    # Collect results
+    for future in concurrent.futures.as_completed(future_to_schema):
+        schema = future_to_schema[future]
+        try:
+            schema_views = future.result()
+            views.extend(schema_views)
+            print(f"✔ Processed {schema}: {len(schema_views)} views")
+        except Exception as exc:
+            print(f"✘ Schema {schema} failed: {exc}")
+
+elapsed_time = time.time() - start_time
+print(f"\nCompleted in {elapsed_time:.2f} seconds")
+print(f"Total views found: {len(views)}")
+
+# Convert the list of views to a DataFrame
+views_df = spark.createDataFrame(views)
+
+display(views_df)

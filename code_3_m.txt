@@ -1,0 +1,437 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Migrate Views
+# MAGIC This notebook copies views and permissions from source client and apply that in destination client. It gets called from Migration Job
+
+# COMMAND ----------
+
+# DBTITLE 1,Widgets
+source_client_id = dbutils.widgets.get('source_client_id')
+source_client_secret = dbutils.widgets.get('source_client_secret')
+source_resource_id = dbutils.widgets.get('source_resource_id')
+source_tenant_id = dbutils.widgets.get('source_tenant_id')
+source_workspace_url = dbutils.widgets.get('source_workspace_url')
+source_catalog_name = dbutils.widgets.get('source_catalog_name')
+
+destination_client_id = dbutils.widgets.get('destination_client_id')
+destination_client_secret = dbutils.widgets.get('destination_client_secret')
+destination_resource_id = dbutils.widgets.get('destination_resource_id')
+destination_tenant_id = dbutils.widgets.get('destination_tenant_id')
+destination_workspace_url = dbutils.widgets.get('destination_workspace_url')
+destination_catalog_name = dbutils.widgets.get('destination_catalog_name')
+destination_client_data_lake_storage_url =  dbutils.widgets.get('destination_client_data_lake_storage_url')
+destination_client_pkgs_container = dbutils.widgets.get('destination_client_pkgs_container')
+destination_client_nick_name = dbutils.widgets.get('destination_client_nick_name')
+
+# COMMAND ----------
+
+# DBTITLE 1,Source and Destination clients
+from databricks.sdk import WorkspaceClient
+from azure.identity import ClientSecretCredential
+from azure.storage.blob import BlobServiceClient
+import base64
+import threading
+
+lock = threading.Lock()
+processed_views_for_privilege = 0
+processed_views_for_creation = 0
+
+authentication_type = 'azure-client-secret'
+azure_environment = 'PUBLIC'
+
+source_client = WorkspaceClient(
+        host=dbutils.widgets.get('source_workspace_url'),
+        auth_type=authentication_type,
+        azure_client_id=dbutils.widgets.get('source_client_id'),
+        azure_client_secret=base64.b64decode(dbutils.widgets.get('source_client_secret').replace('b\'','').replace('\'','')).decode('utf-8'),
+        azure_tenant_id=dbutils.widgets.get('source_tenant_id'),
+        azure_environment=azure_environment,
+        azure_workspace_resource_id=dbutils.widgets.get('source_resource_id')
+    )
+destination_client = WorkspaceClient(
+    host=dbutils.widgets.get('destination_workspace_url'),
+    auth_type=authentication_type,
+    azure_client_id=dbutils.widgets.get('destination_client_id'),
+    azure_client_secret=base64.b64decode(dbutils.widgets.get('destination_client_secret').replace('b\'','').replace('\'','')).decode('utf-8'),
+    azure_tenant_id=dbutils.widgets.get('destination_tenant_id'),
+    azure_environment=azure_environment,
+    azure_workspace_resource_id=dbutils.widgets.get('destination_resource_id')
+)
+
+# COMMAND ----------
+
+# DBTITLE 1,Logging Setup
+import logging
+from enum import Enum
+
+class Color(str, Enum):
+    PURPLE = '\033[95m'
+    CYAN = '\033[96m'
+    DARKCYAN = '\033[36m'
+    BLUE = '\033[94m'
+    GREEN = '\033[92m'
+    BRIGHTGREEN = '\u001b[32;1m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    END = '\033[0m'
+    RESET = '\033[0m'
+
+logging.basicConfig(format=f'{Color.BOLD}[%(asctime)s] %(levelname)s [%(name)s.%(funcName)s:%(lineno)d]{Color.END}'
+                               f' %(message)s')  # do not set level here as it will affect py4j
+logger = logging.getLogger(__name__)
+logger.setLevel("DEBUG")
+migration_log_path = dbutils.jobs.taskValues.get(taskKey = "create_migration_log", key = "migration_log_path")
+logger.info(f'Migration log path: {migration_log_path}')
+
+# COMMAND ----------
+
+# MAGIC %run "./Migration Helper"
+
+# COMMAND ----------
+
+# DBTITLE 1,Data Classes
+from dataclasses import dataclass
+from typing import Optional, List
+
+@dataclass
+class View:
+    view_catalog: str
+    view_schema: str
+    view_name: str
+    view_definition: str
+    check_option: str   
+    is_updatable: bool
+    is_insertable_into: bool     
+    sql_path: str
+    is_materialized: bool
+
+@dataclass
+class ViewPrivilege:
+    view_catalog: str
+    view_schema: str
+    view_name: str
+    grantee: str
+    privilege_type: List[str]
+    
+view_creation_statuses: List[ViewStatus] = []
+view_privilege_statuses: List[ViewStatus] = []
+
+# COMMAND ----------
+
+# DBTITLE 1,View objects get methods
+from pyspark.sql import functions as F
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pyspark.sql.types import StructType, StructField, StringType, LongType
+from typing import List
+from databricks.sdk.service import catalog
+from databricks.sdk.service.sql import EndpointInfo, ResultData, StatementResponse, ResultData, \
+     StatementState, State
+from typing import List, Optional   
+from pyspark.sql.functions import array_sort, collect_list
+
+view_status_schema = StructType([
+            StructField("timestamp", StringType(), True),
+            StructField("source_catalog_name", StringType(), True),
+            StructField("destination_catalog_name", StringType(), True),
+            StructField("schema_name", StringType(), True),
+            StructField("view_name", StringType(), True),                     
+            StructField("status", StringType(), True),
+            StructField("error_group", StringType(), True),
+            StructField("error_message", StringType(), True),
+            StructField("error", StringType(), True),
+            StructField("note", StringType(), True),
+            ])    
+    
+
+migration_warehouse = None
+
+def _execute_sql_statement_wait(client: WorkspaceClient, query: str, warehouse_id: str) -> Optional['ResultData']:    
+    statement: StatementResponse = client.statement_execution.execute_statement(catalog=destination_catalog_name, statement=query, warehouse_id=warehouse_id)    
+    status: StatementState = statement.status.state
+    statement_response: Optional[StatementResponse] = None
+    if status == StatementState.FAILED:
+        raise ValueError(f'Failed to execute sql query \'{query}\' caused by {statement.status.error}')
+    elif status != StatementState.SUCCEEDED:        
+        while status in [StatementState.RUNNING, StatementState.PENDING]:
+            statement_response = client.statement_execution.get_statement(statement.statement_id)
+            status = statement_response.status.state
+        if statement_response and statement_response.status.error:
+            raise ValueError(f'Failed to execute sql statement caused by {statement_response.status.error}')
+    else:
+        statement_response = statement
+
+    all_results = []
+    if statement_response.manifest:
+        for chunk in statement_response.manifest.chunks:
+            chunk_data: ResultData = client.statement_execution.get_statement_result_chunk_n(statement.statement_id, chunk.chunk_index)                
+            all_results.extend(chunk_data.data_array)     
+    return all_results
+
+def _get_migration_warehouse()->EndpointInfo:
+    global migration_warehouse
+    if migration_warehouse is None:
+        destination_warehouses: List[EndpointInfo] = list(destination_client.warehouses.list())
+        migration_warehouse_name = "migration_warehouse"
+        migration_warehouse = next((wh for wh in destination_warehouses if wh.name == migration_warehouse_name), None)            
+        if migration_warehouse is None:
+            migration_warehouse_config = {
+            "name": migration_warehouse_name,
+            "cluster_size": "Medium",
+            "min_num_clusters": 1,
+            "max_num_clusters": 5,
+            "auto_stop_mins": 10,        
+            "enable_serverless_compute": True        
+            }
+            migration_warehouse = destination_client.warehouses.create(**migration_warehouse_config)
+            logger.info(f"Created SQL warehouse with ID: {migration_warehouse.id}")    
+    return migration_warehouse
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Create view and privleges in destination
+from databricks.sdk.service import catalog
+from databricks.sdk.service.catalog import PermissionsChange,SecurableType, Privilege
+from databricks.sdk.service.sql import CreateWarehouseRequest
+
+def migrate_view(view:View,all_missing_views_length)->List[ViewStatus]:
+    try:
+        _get_migration_warehouse()
+        view_full_name = f'{destination_catalog_name}.{view.view_schema}.{view.view_name}'
+        create_view_sql = f"""CREATE VIEW IF NOT EXISTS {view_full_name} AS {view.view_definition} """        
+        sql_result = _execute_sql_statement_wait(client=destination_client,query=create_view_sql,warehouse_id=migration_warehouse.id)   
+        view_creation_statuses.append(ViewStatus(source_catalog_name=source_catalog_name
+                                                     ,destination_catalog_name=destination_catalog_name
+                                                     ,schema_name=view.view_schema
+                                                     ,view_name=view.view_name))   
+        logger.info(f"Successfully migrated view: {view_full_name}")            
+    except Exception as e:
+        logger.error(f"Failed to migrate {view_full_name}: {e}")
+        view_creation_statuses.append(ViewStatus(source_catalog_name=source_catalog_name
+                                                     ,destination_catalog_name=destination_catalog_name
+                                                     ,schema_name=view.view_schema
+                                                     ,view_name=view.view_name, error=f"migrate_view: {str(e)[:1000]}"))
+    finally:        
+        global processed_views_for_creation        
+        with lock:
+            processed_views_for_creation += 1
+            logger.info(f"Processed {processed_views_for_creation}/{all_missing_views_length} views")    
+    return view_creation_statuses
+
+def migrate_view_privilege(view_previlege:ViewPrivilege,all_previleges_length)->List[ViewStatus]:
+    try:        
+        view_full_name = f"{view_previlege.view_catalog}.{view_previlege.view_schema}.{view_previlege.view_name}"
+        
+        privileges = [Privilege[privilege] for privilege in view_previlege.privilege_type]        
+        destination_client.grants.update(
+            full_name=view_full_name,
+            securable_type=catalog.SecurableType.TABLE,            
+            changes=[catalog.PermissionsChange(add=privileges,principal=view_previlege.grantee)]
+        )
+        view_privilege_statuses.append(ViewStatus(source_catalog_name=source_catalog_name
+                                                     ,destination_catalog_name=destination_catalog_name
+                                                     ,schema_name=view_previlege.view_schema
+                                                     ,view_name=view_previlege.view_name))   
+        logger.info(f"Successfully migrated privileges of view: {view_full_name}")       
+    except Exception as e:
+        logger.error(f"Failed to migrate {view_previlege.privilege_type} for {view_previlege.view_catalog}.{view_previlege.view_schema}.{view_previlege.view_name} to {view_previlege.grantee} : {e}")
+        view_privilege_statuses.append(ViewStatus(source_catalog_name=source_catalog_name
+                                                     ,destination_catalog_name=destination_catalog_name
+                                                     ,schema_name=view_previlege.view_schema
+                                                     ,view_name=view_previlege.view_name, error=f"migrate_view_privilege: {str(e)[:1000]}"))
+    finally:
+        global processed_views_for_privilege
+        with lock:
+            processed_views_for_privilege += 1
+            logger.info(f"Processed {processed_views_for_privilege}/{all_previleges_length} privileges")
+    return view_privilege_statuses
+
+# COMMAND ----------
+
+import re
+from typing import List
+import pyspark.sql.types as T
+from pyspark.sql import Row
+import json
+
+try:
+    # ---------------------------------- MIGRATE VIEW ---------------------------------------#
+    logger.info(f"Started collecting view info from source client")
+
+# Multithreaded view collection logic
+def get_schemas(catalog):
+    try:
+        schemas_df = spark.sql(f"SHOW SCHEMAS IN {catalog}")
+        return [row['namespace'] for row in schemas_df.collect() if 'raw' in row['namespace'] or 'cdm' in row['namespace']]
+    except Exception as e:
+        logger.error(f"Error fetching schemas from catalog {catalog}: {e}")
+        return []
+
+def get_views_from_schema(catalog, schema):
+    try:
+        views_df = spark.sql(f"SHOW VIEWS IN {catalog}.{schema}")
+        return [(catalog, schema, row['viewName']) for row in views_df.collect()]
+    except Exception as e:
+        logger.warning(f"Failed to get views from {catalog}.{schema}: {e}")
+        return []
+
+def get_view_ownership():
+    schemas = get_schemas(source_catalog_name)
+    all_views = []
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_schema = {executor.submit(get_views_from_schema, source_catalog_name, schema): schema for schema in schemas}
+        for future in as_completed(future_to_schema):
+            schema = future_to_schema[future]
+            try:
+                views = future.result()
+                all_views.extend(views)
+            except Exception as e:
+                logger.error(f"Error processing schema {schema}: {e}")
+
+    return spark.createDataFrame(all_views, ['view_catalog', 'view_schema', 'view_name'])
+
+def get_view_privilleges(schema_name, client_id):
+    views_df = get_view_ownership()
+    privileges = []
+
+    for row in views_df.collect():
+        catalog, schema, view = row['view_catalog'], row['view_schema'], row['view_name']
+        try:
+            df = spark.sql(f"""
+                SELECT
+                    p.table_catalog AS view_catalog,
+                    p.table_schema AS view_schema,
+                    p.table_name AS view_name,
+                    p.grantee,
+                    p.privilege_type
+                FROM {catalog}.information_schema.table_privileges p
+                WHERE p.table_catalog = '{catalog}'
+                  AND p.table_schema = '{schema}'
+                  AND p.table_name = '{view}'
+                  AND p.inherited_from = 'NONE'
+            """)
+            privileges.extend(df.collect())
+        except Exception as e:
+            logger.warning(f"Failed to get privileges for {catalog}.{schema}.{view}: {e}")
+
+    if privileges:
+        df_privs = spark.createDataFrame(privileges)
+        return df_privs.groupBy("view_catalog", "view_schema", "view_name", "grantee") \
+                       .agg(array_sort(F.collect_list("privilege_type")).alias("privilege_type"))
+    else:
+        return spark.createDataFrame([], "view_catalog STRING, view_schema STRING, view_name STRING, grantee STRING, privilege_type ARRAY<STRING>")
+    source_view_and_ownership = get_view_ownership()
+    all_views_length = source_view_and_ownership.count()
+    logger.info(f'Found {all_views_length} views in source client')       
+    logger.info(f"Successfully collected view info from source client")
+    all_views_length = source_view_and_ownership.count()
+    
+    logger.info(f"Started collecting view info from destination client")
+
+    catalog_items_list = dbutils.jobs.taskValues.get(taskKey="migrate_schemas",key = "catalog_items_list")
+    catalog_items_list = catalog_items_list.replace("'", "\"")
+    catalog_items_list =  json.loads(catalog_items_list)                
+    catalog_items_list = [CatalogItemsInfo(**item) for item in catalog_items_list]
+
+    view_info = next((s for s in catalog_items_list if s.catalog_item == 'view'),None)
+    destination_view_and_ownership = spark.read.parquet(view_info.adls_file_path)
+
+    if destination_view_and_ownership.count() > 0:       
+        missing_views_in_destination = source_view_and_ownership.join(
+            destination_view_and_ownership,
+            on=["view_schema", "view_name"],
+            how="left_anti"
+            )
+
+        all_missing_views_length=missing_views_in_destination.count() 
+        logger.info(f'Found {destination_view_and_ownership.count()} views in destination client')   
+    else:
+        logger.info('No views found in destination client so copying all source views.') 
+        all_missing_views_length =source_view_and_ownership.count()
+        missing_views_in_destination = source_view_and_ownership    
+    logger.info(f"Successfully collected view info from destination client")
+    logger.info(f'Found {all_missing_views_length} views in source that are not present in destination')
+    
+    errors: List[Exception] = []
+    driver_node_type = spark.conf.get("spark.databricks.clusterUsageTags.driverNodeType")
+    max_workers = int(re.search(r'\d+', driver_node_type).group())
+    if all_missing_views_length > 0:
+        logger.info(f"Started migrating views to destination")    
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(migrate_view, View(**row.asDict()),all_missing_views_length) for row in missing_views_in_destination.toLocalIterator()]
+            for future in as_completed(futures):
+                future.result()
+        ExcelLogger.update_excel_log(view_creation_statuses,DeploymentResource.VIEWS,migration_log_path,view_status_schema)
+        e = [status.error for status in view_creation_statuses if status.error]      
+        if e:
+            errors.extend(e)
+        logger.info(f"Successfully migrated views to destination client")
+    else:
+        logger.info(f"No views to migrate")
+
+    # ----------------------------------END MIGRATE VIEW ---------------------------------------#   
+
+
+    # ------------------------------- MIGRATE VIEW PRIVILEGE ------------------------------------#
+    logger.info(f"Started collecting view previleges info from source client")
+    source_view_previleges = get_view_privilleges(source_catalog_name, source_client_id)    
+    logger.info(f'Found {source_view_previleges.count()} view privileges in source client')   
+    logger.info(f"Successfully collected view privileges info from source client")
+
+    logger.info(f"Started collecting view previleges from destination client")
+    view_privilege_info = next((s for s in catalog_items_list if s.catalog_item == 'view_privilege'),None)
+    destination_view_previleges = spark.read.parquet(view_privilege_info.adls_file_path)
+    logger.info(f'Found {destination_view_previleges.count()} view privileges in destination client') 
+    logger.info(f"Successfully collected view privileges from destination client")
+
+    
+    if destination_view_previleges.count() > 0:                     
+        view_privilegess_to_be_migrated = source_view_previleges.join(
+            destination_view_previleges,
+                on=["view_schema", "view_name","grantee","privilege_type"],
+                how="left_anti"
+        )
+        #Ignore any view that failed in migration process earlier
+        view_creation_statuses_filtered_ls = [Row(schema_name=status.schema_name, view_name=status.view_name, error=status.error) for status in view_creation_statuses if status.error is not None and status.error != ""]
+        if len(view_creation_statuses_filtered_ls) > 0:
+            view_creation_statuses_filtered = spark.createDataFrame(view_creation_statuses_filtered_ls)
+            view_privilegess_to_be_migrated = view_privilegess_to_be_migrated.join(
+                view_creation_statuses_filtered,
+                on=(view_privilegess_to_be_migrated["view_schema"] == view_creation_statuses_filtered["schema_name"]) &
+                (view_privilegess_to_be_migrated["view_name"] == view_creation_statuses_filtered["view_name"]),
+                how="left_anti"
+            )
+        all_missing_previleges_length = view_privilegess_to_be_migrated.count()
+    else:
+        logger.info('No view privileges found in destination client so copying all source views privileges.') 
+        all_missing_previleges_length =source_view_previleges.count()
+        view_privilegess_to_be_migrated = source_view_previleges
+
+    logger.info(f'Found {all_missing_previleges_length} privileges in source that are not present in destination')
+
+
+    if all_missing_previleges_length > 0:            
+        logger.info(f"Started migrating view privileges to destination")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(migrate_view_privilege, ViewPrivilege(**row.asDict()), all_missing_previleges_length) 
+                    for row in view_privilegess_to_be_migrated.toLocalIterator()]
+            for future in as_completed(futures):
+                future.result()
+            ExcelLogger.update_excel_log(view_privilege_statuses,DeploymentResource.VIEW_PERMISSIONS ,migration_log_path,view_status_schema)
+            e = [status.error for status in view_privilege_statuses if status.error]     
+            if e:
+                errors.extend(e)
+        logger.info(f"Successfully migrated view privileges to destination client")     
+    # ----------------------------- END MIGRATE VIEW PRIVILEGE ----------------------------------#
+        
+    if errors:
+        errors_rows = [Row(Error=str(e)) for e in errors]
+        schema = T.StructType([T.StructField("Error", T.StringType(), True)])
+        errors_spark_df = spark.createDataFrame(errors_rows, schema)
+        display(errors_spark_df) 
+        raise Exception('Error(s) occurred while migrating schema')  
+except Exception as e:
+    logger.exception(e)

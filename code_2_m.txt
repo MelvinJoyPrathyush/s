@@ -1,0 +1,449 @@
+
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Catalog Items for Migration
+# MAGIC This notebook get list of schemas,tables,views,functions,volumes and their corresponding privilege info from the catalog and save it as parquet file in adls location. This information is used in the migration job to compare the list against source and destination workspace to work out delta changes and only those delta items will be migrated.
+
+# COMMAND ----------
+
+# DBTITLE 1,Widgets
+source_client_id = dbutils.widgets.get('source_client_id')
+source_client_secret = dbutils.widgets.get('source_client_secret')
+source_resource_id = dbutils.widgets.get('source_resource_id')
+source_tenant_id = dbutils.widgets.get('source_tenant_id')
+source_workspace_url = dbutils.widgets.get('source_workspace_url')
+source_catalog_name = dbutils.widgets.get('source_catalog_name')
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Source and Destination clients
+from databricks.sdk import WorkspaceClient
+from azure.identity import ClientSecretCredential
+from azure.storage.blob import BlobServiceClient
+import base64
+import threading
+
+authentication_type = 'azure-client-secret'
+azure_environment = 'PUBLIC'
+
+source_client = WorkspaceClient(
+        host=dbutils.widgets.get('source_workspace_url'),
+        auth_type=authentication_type,
+        azure_client_id=dbutils.widgets.get('source_client_id'),
+        azure_client_secret=base64.b64decode(dbutils.widgets.get('source_client_secret').replace('b\'','').replace('\'','')).decode('utf-8'),
+        azure_tenant_id=dbutils.widgets.get('source_tenant_id'),
+        azure_environment=azure_environment,
+        azure_workspace_resource_id=dbutils.widgets.get('source_resource_id')
+    )
+
+# COMMAND ----------
+
+# DBTITLE 1,Logging Setup
+import logging
+from enum import Enum
+
+class Color(str, Enum):
+    PURPLE = '\033[95m'
+    CYAN = '\033[96m'
+    DARKCYAN = '\033[36m'
+    BLUE = '\033[94m'
+    GREEN = '\033[92m'
+    BRIGHTGREEN = '\u001b[32;1m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    END = '\033[0m'
+    RESET = '\033[0m'
+
+logging.basicConfig(format=f'{Color.BOLD}[%(asctime)s] %(levelname)s [%(name)s.%(funcName)s:%(lineno)d]{Color.END}'
+                               f' %(message)s')  # do not set level here as it will affect py4j
+logger = logging.getLogger(__name__)
+logger.setLevel("DEBUG")
+
+# COMMAND ----------
+
+# DBTITLE 1,Data Classes
+from dataclasses import dataclass
+from typing import Optional, List
+
+@dataclass
+class OutputResponse:
+    catalog_item: str
+    adls_file_path: str
+output_response: List[OutputResponse] = []
+
+# COMMAND ----------
+
+# DBTITLE 1,Table objects get methods
+from pyspark.sql import functions as F
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pyspark.sql.types import StructType, StructField, StringType, LongType
+from typing import List
+from databricks.sdk.service import catalog
+from databricks.sdk.service.sql import EndpointInfo, ResultData, StatementResponse, ResultData, \
+     StatementState, State
+from typing import List, Optional   
+from pyspark.sql.functions import url_decode, col
+import sys
+from pyspark.sql.functions import array_sort, collect_list
+
+migration_warehouse = None
+raw_schema_filter = """t.table_schema like '%_raw%'"""
+external_table_name_filter = """        
+        (
+            t.table_name like '%_json'
+            or t.table_name like '%_index'
+            or t.table_name like '%_summaryjson'
+            or t.table_name like '%_invalidrow'
+            or t.table_name like '%customdataset'
+            or t.table_name like '%_dic_summary'
+            or t.table_name like '%_dic_details'
+        )
+        """
+def get_schema_ownership(catalog_name):
+    main_query = f"""
+        select
+            catalog_name
+            ,schema_name
+            ,schema_owner
+        from {catalog_name}.information_schema.schemata 
+        where 
+        catalog_name = '{catalog_name}' 
+        and schema_name != 'information_schema'
+        """
+    schema_and_ownership = spark.sql(main_query)
+    return schema_and_ownership
+   
+def get_schema_privilleges(catalog_name, client_id):
+    main_query = f"""
+        select
+            p.catalog_name 
+            ,p.schema_name
+            ,p.grantee
+            ,p.privilege_type
+        from {catalog_name}.information_schema.schema_privileges p
+        where 
+        catalog_name = '{catalog_name}' 
+        and p.inherited_from = 'NONE'
+        and schema_name != 'information_schema'
+        """
+    df_schema_privileges = spark.sql(main_query)
+    schema_privileges = (df_schema_privileges.groupBy("catalog_name", "schema_name", "grantee")
+        .agg(array_sort(F.collect_list("privilege_type")).alias("privilege_type")))
+            
+    return schema_privileges
+    
+def get_table_ownership():
+    main_query = f"""
+        select 
+            table_catalog
+            ,table_schema
+            ,table_name
+            ,table_type
+            ,table_owner
+        from 
+        {source_catalog_name}.information_schema.tables t
+        where 
+        table_catalog = '{source_catalog_name}'   
+        and table_type = 'EXTERNAL'
+        and 
+        (
+            table_schema not like '%_landing'     
+            and not 
+            (
+                {raw_schema_filter}
+                and
+                {external_table_name_filter}
+            )
+        )
+        """    
+    df_table_and_ownership = spark.sql(main_query)     
+    return df_table_and_ownership
+
+def get_table_privilleges(schema_name, client_id):
+    main_query = f"""
+        select
+            p.table_catalog
+            ,p.table_schema
+            ,p.table_name
+            ,p.grantee
+            ,p.privilege_type
+        from
+        {source_catalog_name}.information_schema.tables t
+        inner join {source_catalog_name}.information_schema.table_privileges p on p.table_catalog = t.table_catalog
+        and p.table_schema = t.table_schema
+        and p.table_name = t.table_name
+        where
+        p.inherited_from = 'NONE'
+        and t.table_type = 'EXTERNAL'
+        and t.table_catalog = '{source_catalog_name}'        
+        and {raw_schema_filter} 
+        and not {external_table_name_filter}        
+        """    
+    df_table_privileges = spark.sql(main_query)          
+    table_privileges = (
+        df_table_privileges.groupBy("table_catalog", "table_schema","table_name", "grantee")
+        .agg(array_sort(F.collect_list("privilege_type")).alias("privilege_type"))
+    )
+    return table_privileges
+
+
+# Multithreaded view collection logic replacing information_schema.views
+def get_schemas(catalog):
+    try:
+        schemas_df = spark.sql(f"SHOW SCHEMAS IN {catalog}")
+        return [row['namespace'] for row in schemas_df.collect() if 'raw' in row['namespace'] or 'cdm' in row['namespace']]
+    except Exception as e:
+        logger.error(f"Error fetching schemas from catalog {catalog}: {e}")
+        return []
+
+def get_views_from_schema(catalog, schema):
+    try:
+        views_df = spark.sql(f"SHOW VIEWS IN {catalog}.{schema}")
+        return [(catalog, schema, row['viewName']) for row in views_df.collect()]
+    except Exception as e:
+        logger.warning(f"Failed to get views from {catalog}.{schema}: {e}")
+        return []
+
+def get_view_ownership():
+    catalog = source_catalog_name
+    schemas = get_schemas(catalog)
+    all_views = []
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_schema = {executor.submit(get_views_from_schema, catalog, schema): schema for schema in schemas}
+        for future in as_completed(future_to_schema):
+            schema = future_to_schema[future]
+            try:
+                views = future.result()
+                all_views.extend(views)
+            except Exception as e:
+                logger.error(f"Error processing schema {schema}: {e}")
+
+    return spark.createDataFrame(all_views, ['view_catalog', 'view_schema', 'view_name'])
+
+def get_view_privilleges(schema_name, client_id):
+    main_query = f"""
+        select  p.table_catalog as view_catalog
+            ,p.table_schema as view_schema
+            ,p.table_name as view_name
+            ,p.grantee
+            ,p.privilege_type 
+        from {source_catalog_name}.information_schema.`tables` t
+        inner join {source_catalog_name}.information_schema.`views` v 
+            on t.table_catalog = v.table_catalog 
+            and t.table_schema = v.table_schema
+            and t.table_name = v.table_name
+        inner join {source_catalog_name}.information_schema.table_privileges p on p.table_catalog = t.table_catalog
+            and p.table_schema = t.table_schema
+            and p.table_name = t.table_name
+        where
+        p.inherited_from = 'NONE'
+        and t.table_catalog = '{source_catalog_name}'
+        and t.table_type = 'VIEW'
+        and p.table_schema != 'information_schema'      
+        """    
+    df_view_privileges = spark.sql(main_query)          
+    view_privileges = (
+        df_view_privileges.groupBy("view_catalog", "view_schema","view_name", "grantee")
+        .agg(array_sort(F.collect_list("privilege_type")).alias("privilege_type"))
+    )
+    return view_privileges
+
+def get_function_ownership():
+    main_query = f"""
+        SELECT
+            routine_catalog, 
+            routine_schema, 
+            routine_name       
+        FROM
+            {source_catalog_name}.information_schema.routines
+        WHERE
+            routine_type = 'FUNCTION'
+            AND routine_catalog = '{source_catalog_name}'         
+        """    
+    df_function_and_ownership = spark.sql(main_query)
+    return df_function_and_ownership
+
+def get_function_privilleges(schema_name, client_id):
+    main_query = f"""
+        SELECT
+            routine_catalog,
+            routine_schema,
+            routine_name,
+            grantee,
+            privilege_type 
+        FROM
+            {source_catalog_name}.information_schema.routine_privileges p 
+        where
+        p.routine_catalog = '{source_catalog_name}'
+        and p.inherited_from = 'NONE' 
+        """    
+    df_function_privileges = spark.sql(main_query)          
+    function_privileges  = (
+        df_function_privileges.groupBy("routine_catalog", "routine_schema","routine_name", "grantee")
+        .agg(array_sort(F.collect_list("privilege_type")).alias("privilege_type"))
+    )
+    return function_privileges
+
+def get_volume_ownership():
+    main_query = f"""
+        select 
+            volume_catalog
+            ,volume_schema
+            ,volume_name          
+        from 
+        {source_catalog_name}.information_schema.volumes
+        where 
+        volume_catalog = '{source_catalog_name}'   
+        and volume_type = 'EXTERNAL'     
+        """    
+    df_volume_and_ownership = spark.sql(main_query)
+    return df_volume_and_ownership
+
+def get_volume_privilleges(schema_name, client_id):
+    main_query = f"""
+        select
+            p.volume_catalog
+            ,p.volume_schema
+            ,p.volume_name
+            ,p.grantee
+            ,p.privilege_type
+        from        
+        {source_catalog_name}.information_schema.volumes v
+        inner join {source_catalog_name}.information_schema.volume_privileges p on v.volume_catalog = p.volume_catalog 
+            and v.volume_schema = p.volume_schema and v.volume_name = p.volume_name        
+        where
+        v.volume_type = 'EXTERNAL' 
+        and p.inherited_from = 'NONE'
+        and p.volume_schema != 'information_schema'  
+        and p.volume_catalog = '{source_catalog_name}'        
+        """    
+    df_volume_privileges = spark.sql(main_query)          
+    volume_privileges = (
+        df_volume_privileges.groupBy("volume_catalog", "volume_schema","volume_name", "grantee")
+        .agg(array_sort(F.collect_list("privilege_type")).alias("privilege_type"))
+    )
+    return volume_privileges
+
+# COMMAND ----------
+
+import os
+import re
+from typing import List
+import pyspark.sql.types as T
+from pyspark.sql import Row
+import datetime
+
+try:
+    year = datetime.datetime.utcnow().year
+    month = datetime.datetime.utcnow().month
+    day = datetime.datetime.utcnow().day
+    hour = datetime.datetime.utcnow().hour
+    minute = datetime.datetime.utcnow().minute
+    second = datetime.datetime.utcnow().second
+
+    dbx_workspace = source_resource_id.split('/')[-1]
+    pkgs_url = os.getenv("PKGS_BASE_URL")
+    adls_path_prefix = f"{pkgs_url}/migration_logs/catalog_items/{year}_{month}_{day}-{hour}_{minute}_{second}_{dbx_workspace}"
+    
+    logger.info(f"Started collecting schema info")
+    source_schema_and_ownership = get_schema_ownership(source_catalog_name)    
+    logger.info(f'Found {source_schema_and_ownership.count()} schemas')    
+    adls_path = f"{adls_path_prefix}_schemas.parquet"
+    source_schema_and_ownership.repartition(1).write.mode("overwrite").parquet(adls_path)
+    logger.info(f"Schema list saved at {adls_path}")
+    output_response.append(OutputResponse("schema",adls_path))
+    logger.info(f"Successfully collected schema and info")
+
+    logger.info(f"Started collecting schema privileges info from source client")
+    source_schema_previleges = get_schema_privilleges(source_catalog_name, source_client_id)    
+    logger.info(f'Found {source_schema_previleges.count()} schema privileges')    
+    adls_path = f"{adls_path_prefix}_schema_privileges.parquet"
+    source_schema_previleges.repartition(1).write.mode("overwrite").parquet(adls_path)
+    logger.info(f"Schema Privilege list saved at {adls_path}")
+    output_response.append(OutputResponse("schema_previlege",adls_path))
+    logger.info(f"Successfully collected schema and privileges info from source client")
+
+    logger.info(f"Started collecting table info")
+    source_table_and_ownership = get_table_ownership()
+    logger.info(f'Found {source_table_and_ownership.count()} tables')       
+    selected_columns_df = source_table_and_ownership.select("table_schema", "table_name", "table_owner")
+    adls_path = f"{adls_path_prefix}_tables.parquet"
+    selected_columns_df.repartition(1).write.mode("overwrite").parquet(adls_path)
+    output_response.append(OutputResponse("table",adls_path))
+    logger.info(f"Table list saved at {adls_path}")
+    logger.info(f"Successfully collected table info")
+
+    logger.info(f"Started collecting table previleges info")
+    source_table_previleges = get_table_privilleges(source_catalog_name, source_client_id)   
+    logger.info(f'Found {source_table_previleges.count()} table privileges')    
+    adls_path = f"{adls_path_prefix}_table_privileges.parquet"
+    source_table_previleges.repartition(1).write.mode("overwrite").parquet(adls_path)
+    logger.info(f"Table privilege list saved at {adls_path}")
+    output_response.append(OutputResponse("table_privilege",adls_path))
+    logger.info(f"Successfully collected table privileges info")    
+
+    logger.info(f"Started collecting view info")
+    source_view_and_ownership = get_view_ownership()
+    logger.info(f'Found {source_view_and_ownership.count()} views')       
+    selected_columns_df = source_view_and_ownership.select("view_catalog","view_schema", "view_name")
+    adls_path = f"{adls_path_prefix}_views.parquet"
+    selected_columns_df.repartition(1).write.mode("overwrite").parquet(adls_path)
+    output_response.append(OutputResponse("view",adls_path))
+    logger.info(f"view list saved at {adls_path}")
+    logger.info(f"Successfully collected view info")
+
+    logger.info(f"Started collecting view previleges info")
+    source_view_previleges = get_view_privilleges(source_catalog_name, source_client_id)    
+    logger.info(f'Found {source_view_previleges.count()} view privileges')   
+    adls_path = f"{adls_path_prefix}_view_privileges.parquet"
+    source_view_previleges.repartition(1).write.mode("overwrite").parquet(adls_path)
+    logger.info(f"view privilege list saved at {adls_path}")
+    output_response.append(OutputResponse("view_privilege",adls_path))
+    logger.info(f"Successfully collected view privileges info")
+
+
+    logger.info(f"Started collecting function info")    
+    source_function_and_ownership = get_function_ownership()
+    logger.info(f'Found {source_function_and_ownership.count()} functions')      
+    adls_path = f"{adls_path_prefix}_functions.parquet"
+    source_function_and_ownership.repartition(1).write.mode("overwrite").parquet(adls_path)
+    output_response.append(OutputResponse("function",adls_path))
+    logger.info(f"function list saved at {adls_path}")
+    logger.info(f"Successfully collected function info")
+
+    logger.info(f"Started collecting function previleges info")
+    source_function_previleges = get_function_privilleges(source_catalog_name, source_client_id)   
+    logger.info(f'Found {source_function_previleges.count()} function privileges')    
+    adls_path = f"{adls_path_prefix}_function_privileges.parquet"
+    source_function_previleges.repartition(1).write.mode("overwrite").parquet(adls_path)
+    logger.info(f"function privilege list saved at {adls_path}")
+    output_response.append(OutputResponse("function_privilege",adls_path))
+    logger.info(f"Successfully collected function privileges info")  
+
+    logger.info(f"Started collecting volume info")
+    source_volume_and_ownership = get_volume_ownership()
+    logger.info(f'Found {source_volume_and_ownership.count()} volumes')
+    adls_path = f"{adls_path_prefix}_volumes.parquet"
+    source_volume_and_ownership.repartition(1).write.mode("overwrite").parquet(adls_path)
+    output_response.append(OutputResponse("volume",adls_path))
+    logger.info(f"volume list saved at {adls_path}")  
+    logger.info(f"Successfully collected volume info")
+
+    logger.info(f"Started collecting volume previleges info")
+    source_volume_previleges = get_volume_privilleges(source_catalog_name, source_client_id)   
+    logger.info(f'Found {source_volume_previleges.count()} volume privileges')    
+    adls_path = f"{adls_path_prefix}_volume_privileges.parquet"
+    source_volume_previleges.repartition(1).write.mode("overwrite").parquet(adls_path)
+    logger.info(f"volume privilege list saved at {adls_path}")
+    output_response.append(OutputResponse("volume_privilege",adls_path))
+    logger.info(f"Successfully collected volume privileges info")  
+
+    output_response_dicts = [response.__dict__ for response in output_response]
+    dbutils.notebook.exit(output_response_dicts)    
+
+except Exception as e:
+    logger.exception(e)
